@@ -1,0 +1,758 @@
+// ==UserScript==
+// @name         Cdiscount CD 采集助手
+// @namespace    codex.cdiscount.collector
+// @version      2.1.4
+// @description  可见页面逐条采集 Cdiscount 商品，支持人工验证、暂停恢复，并导出 XLSX。
+// @author       小虫
+// @match        https://www.cdiscount.com/*
+// @grant        GM_addStyle
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_xmlhttpRequest
+// @connect      cdiscount.com
+// @connect      www.cdiscount.com
+// @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const HEADERS = [
+    '供你参考', 'EAN', '售价（在售价）', '原价（参考价）', '采集价', '采集运费', '运费', '库存', 'VAT',
+    '发货天数', '底价(系统竞价)', '竞价开启(Yes=开 / No=关)', '店铺名称', '产品链接', '备注栏', '分类编号',
+    '标签', '品牌', 'SKU', '变体尺码', '变体颜色', '产品标题', '短描述（标准描述）', 'HTML描述（A+）',
+    '图片1（主图）', '图片2', '图片3', '图片4', '图片5', '图片6'
+  ];
+
+  const KEY = 'cd_collector_rows_v1';
+  const SETTINGS_KEY = 'cd_collector_settings_v1';
+  const PANEL_KEY = 'cd_collector_panel_v1';
+  const VISIBLE_TASK_KEY = 'cd_collector_visible_task_v1';
+  const defaults = {
+    stock: '100', vat: '0', shippingDays: '5', collectionShipping: '',
+    categoryId: '', tag: '', bidding: '', note: ''
+  };
+
+  const $ = (selector, root = document) => root.querySelector(selector);
+  const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+  const clean = value => String(value ?? '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  const unique = values => [...new Set(values.filter(Boolean))];
+  const getRows = () => GM_getValue(KEY, []);
+  const setRows = rows => GM_setValue(KEY, rows);
+  const getSettings = () => ({ ...defaults, ...GM_getValue(SETTINGS_KEY, {}) });
+
+  function parseNumber(value) {
+    const normalized = clean(value).replace(/[^\d,.-]/g, '').replace(/\.(?=\d{3}(?:\D|$))/g, '').replace(',', '.');
+    const match = normalized.match(/-?\d+(?:\.\d+)?/);
+    return match ? match[0] : '';
+  }
+
+  function tcVarEan(root = document) {
+    const scriptText = [...root.querySelectorAll('script')].map(s => s.textContent || '').join('\n');
+    return clean(scriptText.match(/tc_vars\s*\[\s*["']pr_ean["']\s*\]\s*=\s*["'](\d{8,14})["']/i)?.[1] || '');
+  }
+
+  function jsonLdProducts() {
+    const products = [];
+    $$('script[type="application/ld+json"]').forEach(script => {
+      try {
+        const data = JSON.parse(script.textContent);
+        const visit = node => {
+          if (!node || typeof node !== 'object') return;
+          if (Array.isArray(node)) return node.forEach(visit);
+          const types = (Array.isArray(node['@type']) ? node['@type'] : [node['@type']]).map(x => String(x || '').toLowerCase());
+          if (types.includes('product')) products.push(node);
+          if (node['@graph']) visit(node['@graph']);
+        };
+        visit(data);
+      } catch (_) {}
+    });
+    return products;
+  }
+
+  function meta(names) {
+    for (const name of names) {
+      const el = $(`meta[property="${name}"],meta[name="${name}"],link[rel="${name}"]`);
+      const value = el?.content || el?.href;
+      if (value) return clean(value);
+    }
+    return '';
+  }
+
+  function tableValue(labels) {
+    const wanted = labels.map(x => x.toLowerCase());
+    for (const row of $$('tr, dl > div, .fpDescTb tr')) {
+      const cells = $$('th,td,dt,dd', row).map(x => clean(x.textContent));
+      if (cells.length >= 2 && wanted.some(label => cells[0].toLowerCase().includes(label))) return cells.slice(1).join(' ');
+    }
+    return '';
+  }
+
+  function textNear(labels) {
+    const wanted = labels.map(x => x.toLowerCase());
+    for (const el of $$('body *')) {
+      if (el.children.length > 3) continue;
+      const text = clean(el.textContent);
+      const lower = text.toLowerCase();
+      const label = wanted.find(x => lower.startsWith(x));
+      if (label && text.length < 300) return clean(text.slice(label.length).replace(/^\s*[:：-]\s*/, ''));
+    }
+    return '';
+  }
+
+  function offerFrom(product) {
+    const offers = Array.isArray(product?.offers) ? product.offers[0] : product?.offers;
+    return offers || {};
+  }
+
+  function preloadedState(root = document) {
+    for (const script of root.querySelectorAll('script')) {
+      const text = script.textContent || '';
+      if (!text.includes('PRODUCT_PRELOADED_STATE')) continue;
+      const match = text.match(/PRODUCT_PRELOADED_STATE\s*=\s*JSON\.parse\(("(?:\\.|[^"\\])*")\)/);
+      if (!match) continue;
+      try { return JSON.parse(JSON.parse(match[1])); } catch (_) {}
+    }
+    return null;
+  }
+
+  function findShippingInfo(node, seen = new Set()) {
+    if (!node || typeof node !== 'object' || seen.has(node)) return null;
+    seen.add(node);
+    if ('isFreeShipping' in node || 'shippingPriceMessage' in node) return node;
+    for (const value of Object.values(node)) {
+      const found = findShippingInfo(value, seen);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function findValueByKey(node, key, seen = new Set()) {
+    if (!node || typeof node !== 'object' || seen.has(node)) return '';
+    seen.add(node);
+    if (node[key] !== undefined && node[key] !== null && node[key] !== '') return node[key];
+    for (const value of Object.values(node)) {
+      const found = findValueByKey(value, key, seen);
+      if (found !== '') return found;
+    }
+    return '';
+  }
+
+  function categoryFrom(product, root = document) {
+    const path = clean(findValueByKey(preloadedState(root), 'categoryCodePath'));
+    if (path) return path.split('/').filter(Boolean).pop() || path;
+    const scriptText = [...root.querySelectorAll('script')].map(s => s.textContent || '').join('\n');
+    const rawPath = scriptText.match(/categoryCodePath\\?"\s*:\s*\\?"([^"\\]+(?:\\?\/[^"\\]+)*)/i)?.[1]?.replace(/\\\//g, '/');
+    if (rawPath) return rawPath.split('/').filter(Boolean).pop() || rawPath;
+    const tagCategory = scriptText.match(/tc_vars\["pr_category_id"\]\s*=\s*"([0-9A-Z]+)"/i)?.[1] || '';
+    if (/[A-Z]/i.test(tagCategory)) return tagCategory;
+    return clean(product?.category || '');
+  }
+
+  function shippingFrom(product, root = document) {
+    const offer = offerFrom(product);
+    const details = Array.isArray(offer.shippingDetails) ? offer.shippingDetails[0] : offer.shippingDetails;
+    const rate = details?.shippingRate;
+    const value = typeof rate === 'object' ? rate?.value : rate;
+    if (value !== undefined && value !== null && value !== '') return parseNumber(value);
+    const stateShipping = findShippingInfo(preloadedState(root));
+    if (stateShipping?.isFreeShipping === true) return '0';
+    const messagePrice = parseNumber(stateShipping?.shippingPriceMessage || stateShipping?.freeShipping || '');
+    if (messagePrice !== '') return messagePrice;
+    const deliveryText = clean([...root.querySelectorAll('section,div')]
+      .find(el => /livraison gratuite/i.test(el.textContent || '') && (el.textContent || '').length < 500)?.textContent);
+    if (deliveryText) return '0';
+    return '';
+  }
+
+  function productRef(product) {
+    const url = location.pathname;
+    const tail = (url.match(/-([a-z0-9]+)\.html/i) || [])[1] || '';
+    return clean(product?.sku || product?.mpn || tableValue(['référence', 'reference', 'code']) || tail).toUpperCase();
+  }
+
+  function marketingDescriptionHtml(root = document) {
+    const frame = root.querySelector('iframe[title="Descriptif Marketing"], iframe[srcdoc][title*="Marketing" i]');
+    if (!frame) return '';
+    try {
+      const liveHtml = frame.contentDocument?.body?.innerHTML?.trim();
+      if (liveHtml) return liveHtml;
+    } catch (_) {}
+    const srcdoc = frame.getAttribute('srcdoc')?.trim() || '';
+    if (srcdoc) return srcdoc;
+    return '';
+  }
+
+  function descriptionHtml(product) {
+    // Cdiscount 的完整“Présentation du produit”通常放在标题为
+    // “Descriptif Marketing”的 srcdoc iframe 中，而不是普通描述节点里。
+    const marketing = marketingDescriptionHtml(document);
+    if (marketing) return marketing;
+    const candidates = [
+      '#fpPresentation', '#fpDesc', '[itemprop="description"]', '.fpDesc', '.product-description',
+      '[data-testid*="description"]', '[class*="description"]'
+    ];
+    for (const selector of candidates) {
+      const el = $(selector);
+      if (el && clean(el.textContent).length > 40) {
+        const clone = el.cloneNode(true);
+        $$('script,style,button,svg,noscript', clone).forEach(x => x.remove());
+        return clone.innerHTML.trim();
+      }
+    }
+    const raw = product?.description || '';
+    return /<[^>]+>/.test(raw) ? raw : (raw ? `<p>${escapeHtml(clean(raw))}</p>` : '');
+  }
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function imageUrls(product) {
+    const fromLd = Array.isArray(product?.image) ? product.image : [product?.image];
+    const fromPage = $$('img').map(img => img.currentSrc || img.src || img.dataset.src || img.dataset.zoomImage)
+      .filter(src => src && /cdiscount\.com|cdscdn\.com/i.test(src))
+      .filter(src => /pdt|product|zoom|640x640|700x700|image/i.test(src));
+    return uniqueImageUrls([...fromLd, meta(['og:image', 'twitter:image']), ...fromPage]).slice(0, 6);
+  }
+
+  function normalizeImageUrl(value) {
+    if (!value) return '';
+    try {
+      const url = new URL(value, location.href);
+      url.hash = '';
+      url.search = '';
+      url.pathname = url.pathname
+        .replace(/\/(?:\d{2,4})x(?:\d{2,4})(?=\/)/gi, '/700x700')
+        .replace(/([_-])(?:\d{2,4})x(?:\d{2,4})(?=\.[a-z]+$)/i, (_match, separator) => `${separator}700x700`);
+      return url.href;
+    } catch (_) {
+      return String(value).replace(/[?#].*$/, '').replace(/\/(?:\d{2,4})x(?:\d{2,4})\//gi, '/700x700/');
+    }
+  }
+
+  function imageIdentity(value) {
+    return normalizeImageUrl(value)
+      .replace(/\/700x700(?=\/)/gi, '/SIZE')
+      .replace(/([_-])700x700(?=\.[a-z]+$)/i, '$1SIZE')
+      .toLowerCase();
+  }
+
+  function uniqueImageUrls(values) {
+    const seen = new Set();
+    const result = [];
+    for (const value of values || []) {
+      const normalized = normalizeImageUrl(value);
+      const key = imageIdentity(normalized);
+      if (!normalized || !key || seen.has(key)) continue;
+      seen.add(key);
+      result.push(normalized);
+    }
+    return result;
+  }
+
+  function collect() {
+    const product = jsonLdProducts()[0] || {};
+    const offer = offerFrom(product);
+    const settings = getSettings();
+    const detectedShipping = shippingFrom(product, document);
+    const detectedCategory = categoryFrom(product, document);
+    const title = clean(product.name || meta(['og:title', 'twitter:title']) || $('h1')?.textContent).replace(/\s*-\s*Cdiscount.*$/i, '');
+    const price = parseNumber(offer.price || meta(['product:price:amount']) || $('[itemprop="price"]')?.content || $('[itemprop="price"]')?.textContent || $('.fpPrice')?.textContent);
+    const oldPrice = parseNumber($('.fpPriceBarre, .prdtPriceStrike, [class*="oldPrice"], [class*="crossed"]')?.textContent || textNear(['prix de comparaison', 'prix conseillé']));
+    const ref = productRef(product);
+    const rawDescription = product.description || meta(['description', 'og:description']) || '';
+    const shortDescription = clean($('[itemprop="description"]')?.textContent || rawDescription || $('.fpDesc')?.textContent);
+    const images = imageUrls(product);
+    const availability = String(offer.availability || '').toLowerCase();
+    const stock = /outofstock|soldout|indisponible/.test(availability + ' ' + document.body.innerText.toLowerCase()) ? '0' : settings.stock;
+    const brand = clean(typeof product.brand === 'object' ? product.brand?.name : product.brand) || tableValue(['marque', 'brand']);
+    const seller = clean(offer.seller?.name || $('[class*="seller"] [class*="name"], [data-testid*="seller"]')?.textContent || textNear(['vendu par', 'seller']));
+    const ean = clean(product.gtin13 || product.gtin14 || product.gtin12 || product.gtin || tcVarEan(document) || tableValue(['ean', 'gtin', 'code-barres', 'code barres']));
+    const size = clean(tableValue(['taille', 'dimensions']) || $('[data-testid*="size"] [aria-selected="true"]')?.textContent);
+    const color = clean(tableValue(['couleur', 'coloris']) || $('[data-testid*="color"] [aria-selected="true"]')?.textContent);
+
+    return {
+      '供你参考': ref, 'EAN': ean, '售价（在售价）': price, '原价（参考价）': oldPrice,
+      '采集价': price, '采集运费': detectedShipping !== '' ? detectedShipping : settings.collectionShipping, '运费': '',
+      '库存': stock, 'VAT': settings.vat, '发货天数': settings.shippingDays,
+      '底价(系统竞价)': '', '竞价开启(Yes=开 / No=关)': settings.bidding,
+      '店铺名称': seller, '产品链接': location.href.split('#')[0], '备注栏': settings.note,
+      '分类编号': detectedCategory || settings.categoryId, '标签': settings.tag, '品牌': brand, 'SKU': '',
+      '变体尺码': size, '变体颜色': color, '产品标题': title,
+      '短描述（标准描述）': shortDescription, 'HTML描述（A+）': descriptionHtml(product),
+      ...Object.fromEntries(Array.from({ length: 6 }, (_, i) => [i === 0 ? '图片1（主图）' : `图片${i + 1}`, images[i] || '']))
+    };
+  }
+
+  const batch = { urls: [], index: 0, paused: false, stopped: false, running: false, success: 0, failed: 0 };
+
+  function requestDoc(url) {
+    return new Promise((resolve, reject) => GM_xmlhttpRequest({
+      method: 'GET', url, timeout: 30000,
+      onload: r => r.status >= 200 && r.status < 400
+        ? resolve(new DOMParser().parseFromString(r.responseText, 'text/html'))
+        : reject(new Error(`HTTP ${r.status}`)),
+      onerror: () => reject(new Error('网络请求失败')),
+      ontimeout: () => reject(new Error('请求超时'))
+    }));
+  }
+
+  function validUrl(value, base = location.href) {
+    try {
+      const u = new URL(value, base);
+      if (!/(^|\.)cdiscount\.com$/i.test(u.hostname)) return '';
+      u.hash = '';
+      return u.href;
+    } catch (_) { return ''; }
+  }
+
+  function canonicalProductUrl(value, base = location.href) {
+    const valid = validUrl(value, base);
+    if (!valid) return '';
+    const url = new URL(valid);
+    url.hostname = 'www.cdiscount.com';
+    const offerId = url.searchParams.get('idOffre');
+    url.search = '';
+    if (offerId) url.searchParams.set('idOffre', offerId);
+    url.hash = '';
+    return url.href;
+  }
+
+  function productIdentity(value) {
+    try {
+      const path = decodeURIComponent(new URL(value, location.href).pathname).replace(/\/$/, '');
+      return (path.match(/\/(f-[^/]+\.html)$/i)?.[1] || '').toLowerCase();
+    } catch (_) { return ''; }
+  }
+
+  function uniqueProductUrls(values) {
+    const seen = new Set();
+    const result = [];
+    for (const value of values || []) {
+      const url = canonicalProductUrl(value);
+      if (!url) continue;
+      const parsed = new URL(url);
+      const key = productIdentity(url) || `${parsed.hostname.replace(/^www\./i, '').toLowerCase()}${decodeURIComponent(parsed.pathname).replace(/\/$/, '').toLowerCase()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push(url);
+    }
+    return result;
+  }
+
+  function linksFrom(doc, base) {
+    return uniqueProductUrls([...doc.querySelectorAll('a[href]')]
+      .map(a => canonicalProductUrl(a.getAttribute('href'), base))
+      .filter(url => url && /\/f-[^/?#]+\.html$/i.test(new URL(url).pathname)));
+  }
+
+  function pageUrl(base, page) {
+    const url = new URL(base);
+    url.searchParams.set('page', String(page));
+    url.hash = '';
+    return url.href;
+  }
+
+  function nextFrom(doc, base) {
+    const candidates = [...doc.querySelectorAll('a[rel="next"],a[aria-label*="suiv" i],a[title*="suiv" i],.pagination a')];
+    const a = candidates.find(x => /suiv|next|›|»/i.test(clean(x.getAttribute('aria-label') || x.title || x.textContent)));
+    return a ? validUrl(a.getAttribute('href'), base) : '';
+  }
+
+  function rowFromDoc(doc, url) {
+    const q = s => doc.querySelector(s);
+    const all = s => [...doc.querySelectorAll(s)];
+    const ld = [];
+    all('script[type="application/ld+json"]').forEach(s => {
+      try {
+        const walk = n => { if (!n || typeof n !== 'object') return; if (Array.isArray(n)) return n.forEach(walk); const types=(Array.isArray(n['@type'])?n['@type']:[n['@type']]).map(x=>String(x||'').toLowerCase()); if (types.includes('product')) ld.push(n); if (n['@graph']) walk(n['@graph']); };
+        walk(JSON.parse(s.textContent));
+      } catch (_) {}
+    });
+    const p = ld[0] || {}, offer = (Array.isArray(p.offers) ? p.offers[0] : p.offers) || {}, settings = getSettings();
+    const m = names => { for (const name of names) { const el = q(`meta[property="${name}"],meta[name="${name}"]`); if (el?.content) return clean(el.content); } return ''; };
+    const tv = labels => {
+      const wanted = labels.map(x => x.toLowerCase());
+      for (const tr of all('tr,dl>div')) {
+        const cells = [...tr.querySelectorAll('th,td,dt,dd')].map(x => clean(x.textContent));
+        if (cells.length > 1 && wanted.some(x => cells[0].toLowerCase().includes(x))) return cells.slice(1).join(' ');
+      }
+      return '';
+    };
+    const title = clean(p.name || m(['og:title']) || q('h1')?.textContent).replace(/\s*-\s*Cdiscount.*$/i, '');
+    const price = parseNumber(offer.price || m(['product:price:amount']) || q('[itemprop="price"]')?.content || q('[itemprop="price"]')?.textContent);
+    const ref = clean(p.sku || p.mpn || tv(['référence', 'reference']) || (new URL(url).pathname.match(/-([a-z0-9]+)\.html/i) || [])[1]).toUpperCase();
+    const desc = p.description || m(['description', 'og:description']) || '';
+    const descEl = q('#fpPresentation,#fpDesc,[itemprop="description"],.fpDesc,.product-description,[data-testid*="description"]');
+    const marketingHtml = marketingDescriptionHtml(doc);
+    const imageList = Array.isArray(p.image) ? p.image : [p.image];
+    const images = uniqueImageUrls([...imageList, m(['og:image']), ...all('img').map(x => x.currentSrc || x.src || x.dataset.src || x.dataset.zoomImage).filter(x => x && /pdt|product|zoom|640x640|700x700/i.test(x))]).slice(0, 6);
+    const brand = clean(typeof p.brand === 'object' ? p.brand?.name : p.brand) || tv(['marque', 'brand']);
+    const seller = clean(offer.seller?.name || q('[class*="seller"] [class*="name"],[data-testid*="seller"]')?.textContent);
+    const unavailable = /outofstock|soldout|indisponible/.test(String(offer.availability || '').toLowerCase());
+    const detectedShipping = shippingFrom(p, doc);
+    const detectedCategory = categoryFrom(p, doc) || tv(['catégorie', 'category']);
+    return {
+      '供你参考': ref, 'EAN': clean(p.gtin13 || p.gtin14 || p.gtin12 || p.gtin || tcVarEan(doc) || tv(['ean', 'gtin', 'code-barres'])),
+      '售价（在售价）': price, '原价（参考价）': parseNumber(q('.fpPriceBarre,.prdtPriceStrike,[class*="oldPrice"],[class*="crossed"]')?.textContent),
+      '采集价': price, '采集运费': detectedShipping !== '' ? detectedShipping : settings.collectionShipping,
+      '运费': '', '库存': unavailable ? '0' : settings.stock,
+      'VAT': settings.vat, '发货天数': settings.shippingDays, '底价(系统竞价)': '', '竞价开启(Yes=开 / No=关)': settings.bidding,
+      '店铺名称': seller, '产品链接': url, '备注栏': settings.note, '分类编号': detectedCategory || settings.categoryId, '标签': settings.tag,
+      '品牌': brand, 'SKU': '', '变体尺码': tv(['taille', 'dimensions']), '变体颜色': tv(['couleur', 'coloris']),
+      '产品标题': title, '短描述（标准描述）': clean(q('[itemprop="description"]')?.textContent || desc),
+      'HTML描述（A+）': marketingHtml || descEl?.innerHTML?.trim() || (/<[^>]+>/.test(desc) ? desc : (desc ? `<p>${escapeHtml(clean(desc))}</p>` : '')),
+      ...Object.fromEntries(Array.from({ length: 6 }, (_, i) => [i === 0 ? '图片1（主图）' : `图片${i + 1}`, images[i] || '']))
+    };
+  }
+
+  function progress(text, detail = '') {
+    const status = $('#cdca-task-status');
+    const detailEl = $('#cdca-task-detail');
+    if (status) status.textContent = text;
+    if (detailEl) detailEl.textContent = detail;
+    updateBatchStats();
+  }
+
+  function updateBatchStats() {
+    const task = getVisibleTask?.() || null;
+    if (task) {
+      batch.urls = task.urls || [];
+      batch.index = task.index || 0;
+      batch.success = task.success || 0;
+      batch.failed = task.failed || 0;
+    }
+    const total = batch.urls.length;
+    const values = {
+      '#cdca-link-count': total,
+      '#cdca-done-count': batch.success,
+      '#cdca-fail-count': batch.failed,
+      '#cdca-task-progress': `${Math.min(batch.index, total)}/${total}`
+    };
+    Object.entries(values).forEach(([selector, value]) => { const el = $(selector); if (el) el.textContent = value; });
+  }
+
+  function getVisibleTask() {
+    return GM_getValue(VISIBLE_TASK_KEY, null);
+  }
+
+  function saveVisibleTask(task) {
+    GM_setValue(VISIBLE_TASK_KEY, task);
+    batch.urls = task?.urls || [];
+    batch.index = task?.index || 0;
+    batch.success = task?.success || 0;
+    batch.failed = task?.failed || 0;
+    batch.paused = !!task?.paused;
+    batch.stopped = !task?.active;
+    batch.running = !!task?.active && !task?.paused;
+    updateBatchStats();
+  }
+
+  function samePage(a, b) {
+    try {
+      const x = new URL(a), y = new URL(b);
+      const hostX = x.hostname.replace(/^www\./i, '').toLowerCase();
+      const hostY = y.hostname.replace(/^www\./i, '').toLowerCase();
+      const productX = productIdentity(x.href), productY = productIdentity(y.href);
+      if (productX && productY) return hostX === hostY && productX === productY;
+      const pathX = decodeURIComponent(x.pathname).replace(/\/$/, '').toLowerCase();
+      const pathY = decodeURIComponent(y.pathname).replace(/\/$/, '').toLowerCase();
+      if (hostX !== hostY || pathX !== pathY) return false;
+      for (const key of ['page']) {
+        if (y.searchParams.has(key) && x.searchParams.get(key) !== y.searchParams.get(key)) return false;
+      }
+      return true;
+    } catch (_) { return false; }
+  }
+
+  function looksLikeVerificationPage() {
+    const title = clean(document.title).toLowerCase();
+    const sample = clean((document.body?.innerText || '').slice(0, 5000)).toLowerCase();
+    const challengeSelectors = [
+      '#cf-challenge-running', '#challenge-running', '#challenge-form',
+      '[class*="captcha" i]', '[id*="captcha" i]',
+      'iframe[src*="captcha" i]', 'iframe[src*="challenge" i]',
+      '[data-sitekey]'
+    ].join(',');
+    const visibleChallenge = [...document.querySelectorAll(challengeSelectors)].some(el => {
+      const rect = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      return rect.width > 20 && rect.height > 20 && style.display !== 'none' && style.visibility !== 'hidden';
+    });
+    if (visibleChallenge) return true;
+    if (/just a moment|attention required|security verification|vérification de sécurité|contrôle de sécurité|正在进行安全验证|安全验证/.test(title)) return true;
+    return /verify you are human|human verification|checking your browser|confirmez que vous êtes humain|vérifions que vous n['’]êtes pas un robot|veuillez compléter le captcha|正在验证您不是自动程序|请完成安全验证/.test(sample);
+  }
+
+  function goVisible(url, delay = 900) {
+    progress('即将打开可见页面', url);
+    setTimeout(() => {
+      if (samePage(location.href, url)) return processVisibleTask();
+      location.href = url;
+    }, Math.min(delay, 500));
+  }
+
+  function startVisibleProducts(urls) {
+    const list = uniqueProductUrls(urls || []);
+    if (!list.length) return alert('没有识别到有效的 Cdiscount 商品网址。');
+    const task = { active: true, paused: false, waiting: false, phase: 'products', urls: list, index: 0, success: 0, failed: 0 };
+    saveVisibleTask(task);
+    goVisible(list[0]);
+  }
+
+  async function processVisibleTask() {
+    const task = getVisibleTask();
+    if (!task?.active) return;
+    if (task.phase === 'products' && Array.isArray(task.urls)) {
+      const completed = task.urls.slice(0, task.index || 0);
+      const remaining = uniqueProductUrls(task.urls.slice(task.index || 0));
+      task.urls = [...completed, ...remaining];
+    }
+    saveVisibleTask(task);
+    if (task.paused) return progress(`已暂停 ${task.index || 0}/${task.urls?.length || 0}`, '点击“恢复”继续可见页面采集');
+    if (looksLikeVerificationPage()) {
+      task.waiting = true; saveVisibleTask(task);
+      progress('等待您完成人工验证', '请直接在当前页面完成验证；通过后插件会自动继续');
+      return setTimeout(processVisibleTask, 3000);
+    }
+
+    if (task.phase === 'lists') {
+      const target = pageUrl(task.baseUrl, task.currentPage);
+      if (!samePage(location.href, target)) return goVisible(target);
+      const found = linksFrom(document, target);
+      if (!found.length) {
+        task.waiting = true; saveVisibleTask(task);
+        progress('等待人工验证或页面加载', `完成验证后请停留在此页，插件会自动继续检查\n${target}`);
+        return setTimeout(processVisibleTask, 3000);
+      }
+      task.waiting = false;
+      task.urls = unique([...(task.urls || []), ...found]);
+      if (task.currentPage < task.endPage) {
+        task.currentPage++;
+        saveVisibleTask(task);
+        return goVisible(pageUrl(task.baseUrl, task.currentPage), 1200);
+      }
+      if (!task.urls.length) {
+        task.active = false; saveVisibleTask(task);
+        return alert('指定页面范围没有识别到商品链接。');
+      }
+      task.phase = 'products'; task.index = 0;
+      saveVisibleTask(task);
+      return goVisible(task.urls[0], 1200);
+    }
+
+    const url = task.urls[task.index];
+    if (!url) {
+      task.active = false; task.waiting = false; saveVisibleTask(task);
+      progress('采集完成', `成功 ${task.success}，失败 ${task.failed}`);
+      return alert(`采集完成：成功 ${task.success} 条，失败 ${task.failed} 条。`);
+    }
+    if (!samePage(location.href, url)) return goVisible(url);
+
+    const row = collect();
+    if (!row['产品标题']) {
+      task.waiting = true; saveVisibleTask(task);
+      progress('等待人工验证或商品页面加载', `完成验证后请停留在此页，插件会自动继续检查\n${url}`);
+      return setTimeout(processVisibleTask, 3000);
+    }
+
+    const rows = getRows();
+    const old = rows.findIndex(x => x['产品链接'] === row['产品链接']);
+    if (old >= 0) rows[old] = row; else rows.push(row);
+    setRows(rows); updateCount();
+    task.success++; task.index++; task.waiting = false;
+    saveVisibleTask(task);
+    progress(`已采集 ${task.index}/${task.urls.length}`, `成功 ${task.success}，失败 ${task.failed}\n${url}`);
+    const next = task.urls[task.index];
+    if (next) return goVisible(next, 1500);
+    setTimeout(processVisibleTask, 500);
+  }
+
+  function runBatch(urls) {
+    startVisibleProducts(urls);
+  }
+
+  function collectListPages() {
+    const baseUrl = validUrl($('#cdca-list-url').value.trim() || location.href);
+    const startPage = Math.max(1, parseInt($('#cdca-start-page').value, 10) || 1);
+    const endPage = Math.min(200, Math.max(startPage, parseInt($('#cdca-end-page').value, 10) || startPage));
+    if (!baseUrl) return alert('请输入有效的 Cdiscount 列表页网址。');
+    const task = { active: true, paused: false, waiting: false, phase: 'lists', baseUrl, startPage, endPage, currentPage: startPage, urls: [], index: 0, success: 0, failed: 0 };
+    saveVisibleTask(task);
+    goVisible(pageUrl(baseUrl, startPage));
+  }
+
+  function downloadXlsx(rows) {
+    if (!rows.length) return alert('采集列表为空，请先添加商品。');
+    const data = rows.map(row => Object.fromEntries(HEADERS.map(h => [h, h === 'SKU' ? '' : (row[h] ?? '')])));
+    const ws = XLSX.utils.json_to_sheet(data, { header: HEADERS });
+    ws['!cols'] = HEADERS.map((h, i) => ({ wch: i >= 21 ? 32 : Math.max(12, h.length * 2 + 2) }));
+    ws['!autofilter'] = { ref: `A1:AD${rows.length + 1}` };
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
+    XLSX.writeFile(wb, `CD采集_${new Date().toISOString().slice(0, 10)}.xlsx`, { compression: true });
+  }
+
+  function renderPreview(row) {
+    const body = $('#cdca-preview-body');
+    body.innerHTML = HEADERS.map(h => `<label><span>${escapeHtml(h)}</span><textarea data-field="${escapeHtml(h)}">${escapeHtml(row[h] ?? '')}</textarea></label>`).join('');
+    $('#cdca-modal').classList.add('open');
+  }
+
+  function readPreviewRow() {
+    const row = {};
+    $$('#cdca-preview-body [data-field]').forEach(el => row[el.dataset.field] = el.value.trim());
+    return row;
+  }
+
+  function savePreview(close = true) {
+    const row = readPreviewRow();
+    const rows = getRows();
+    const index = rows.findIndex(x => x['产品链接'] === row['产品链接']);
+    if (index >= 0) rows[index] = row; else rows.push(row);
+    setRows(rows);
+    if (close) $('#cdca-modal').classList.remove('open');
+    updateCount();
+    toast(index >= 0 ? '已更新当前商品' : '已加入采集列表');
+    return row;
+  }
+
+  function updateCount() { const el = $('#cdca-count'); if (el) el.textContent = getRows().length; }
+  function toast(message) {
+    const el = document.createElement('div'); el.className = 'cdca-toast'; el.textContent = message;
+    document.body.appendChild(el); setTimeout(() => el.remove(), 1800);
+  }
+
+  function editSettings() {
+    const s = getSettings();
+    const names = [
+      ['stock', '默认库存'], ['vat', 'VAT'], ['shippingDays', '发货天数'],
+      ['collectionShipping', '采集运费'], ['categoryId', '分类编号'], ['tag', '标签'], ['bidding', '竞价开启(Yes/No)'], ['note', '备注']
+    ];
+    const result = {};
+    for (const [key, label] of names) {
+      const value = prompt(`${label}：`, s[key] ?? '');
+      if (value === null) return;
+      result[key] = value.trim();
+    }
+    GM_setValue(SETTINGS_KEY, { ...s, ...result });
+    toast('默认设置已保存');
+  }
+
+  function mount() {
+    document.body.insertAdjacentHTML('beforeend', `
+      <div id="cdca-panel">
+        <div id="cdca-panel-head"><strong>CD 批量采集助手 <em>v2.1.4 可见采集</em></strong><button id="cdca-minimize" title="最小化">－</button></div>
+        <div id="cdca-panel-body">
+          <div class="cdca-stats">
+            <div>当前已收集链接：<b id="cdca-link-count">0</b></div><div>当前已采集数据：<b id="cdca-count">0</b></div>
+            <div>成功 / 失败：<b id="cdca-done-count">0</b> / <b id="cdca-fail-count">0</b></div><div>当前任务进度：<b id="cdca-task-progress">0/0</b></div>
+            <div id="cdca-task-status">等待开始</div><small id="cdca-task-detail"></small>
+          </div>
+          <label>列表页网址（可选）<input id="cdca-list-url" type="text" placeholder="留空则使用当前列表页"></label>
+          <div class="cdca-pages"><label>开始页<input id="cdca-start-page" type="number" min="1" value="1"></label><label>结束页<input id="cdca-end-page" type="number" min="1" value="1"></label></div>
+          <button id="cdca-list-start">按页面可见采集列表</button>
+          <label>直接粘贴商品网址（每行一个）<textarea id="cdca-url-input" placeholder="https://www.cdiscount.com/.../商品.html"></textarea></label>
+          <button id="cdca-url-start">开始可见采集网址</button>
+          <button id="cdca-preview">采集并导出当前商品 XLSX</button>
+          <div class="cdca-controls"><button id="cdca-pause">暂停</button><button id="cdca-resume">恢复</button><button id="cdca-stop">停止</button></div>
+          <button id="cdca-export" class="primary">导出全部 XLSX</button>
+          <div class="cdca-controls"><button id="cdca-settings">默认设置</button><button id="cdca-clear">清空列表</button></div>
+        </div>
+      </div>
+      <div id="cdca-modal"><div class="cdca-card"><header><strong>采集预览（可修改）</strong><button id="cdca-close">×</button></header>
+        <div id="cdca-preview-body"></div><footer><button id="cdca-export-current">导出当前 XLSX</button><button id="cdca-save">保存到列表</button></footer></div></div>`);
+    $('#cdca-preview').onclick = () => {
+      const row = collect();
+      if (!row['产品标题']) return alert('当前页面未识别到商品标题，请确认这是 Cdiscount 商品详情页。');
+      downloadXlsx([row]);
+    };
+    $('#cdca-export').onclick = () => downloadXlsx(getRows());
+    $('#cdca-list-start').onclick = collectListPages;
+    $('#cdca-url-start').onclick = () => runBatch($('#cdca-url-input').value.split(/[\s,;]+/));
+    $('#cdca-pause').onclick = () => {
+      const task = getVisibleTask();
+      if (!task?.active) return toast('当前没有运行中的任务');
+      task.paused = true; saveVisibleTask(task); progress('已暂停', '点击“恢复”继续采集');
+    };
+    $('#cdca-resume').onclick = () => {
+      const task = getVisibleTask();
+      if (!task?.active) return toast('没有可恢复的任务');
+      task.paused = false; task.waiting = false; saveVisibleTask(task); processVisibleTask();
+    };
+    $('#cdca-stop').onclick = () => {
+      const task = getVisibleTask();
+      if (!task?.active) return toast('当前没有运行中的任务');
+      task.active = false; task.paused = false; task.waiting = false; saveVisibleTask(task); progress('任务已停止', `成功 ${task.success || 0}，失败 ${task.failed || 0}`);
+    };
+    $('#cdca-settings').onclick = editSettings;
+    $('#cdca-clear').onclick = () => { if (confirm(`确定清空 ${getRows().length} 条已采集数据吗？`)) { setRows([]); updateCount(); } };
+    $('#cdca-close').onclick = () => $('#cdca-modal').classList.remove('open');
+    $('#cdca-save').onclick = savePreview;
+    $('#cdca-export-current').onclick = () => { const row = savePreview(false); downloadXlsx([row]); };
+    $('#cdca-minimize').onclick = () => { const panel = $('#cdca-panel'); panel.classList.toggle('minimized'); $('#cdca-minimize').textContent = panel.classList.contains('minimized') ? '＋' : '－'; };
+    makePanelMovable();
+    updateCount();
+    updateBatchStats();
+  }
+
+  function makePanelMovable() {
+    const panel = $('#cdca-panel'), handle = $('#cdca-panel-head');
+    const saved = GM_getValue(PANEL_KEY, null);
+    if (saved) { panel.style.left = `${saved.left}px`; panel.style.top = `${saved.top}px`; panel.style.right = 'auto'; }
+    let dragging = false, offsetX = 0, offsetY = 0;
+    handle.addEventListener('pointerdown', event => {
+      if (event.target.closest('button')) return;
+      dragging = true; offsetX = event.clientX - panel.offsetLeft; offsetY = event.clientY - panel.offsetTop;
+      handle.setPointerCapture(event.pointerId);
+    });
+    handle.addEventListener('pointermove', event => {
+      if (!dragging) return;
+      panel.style.left = `${Math.max(0, Math.min(innerWidth - panel.offsetWidth, event.clientX - offsetX))}px`;
+      panel.style.top = `${Math.max(0, Math.min(innerHeight - 42, event.clientY - offsetY))}px`;
+      panel.style.right = 'auto';
+    });
+    handle.addEventListener('pointerup', event => {
+      if (!dragging) return; dragging = false; handle.releasePointerCapture(event.pointerId);
+      GM_setValue(PANEL_KEY, { left: panel.offsetLeft, top: panel.offsetTop });
+    });
+  }
+
+  GM_addStyle(`
+    #cdca-panel{position:fixed;right:18px;top:70px;z-index:2147483646;width:330px;background:#17335f;color:#fff;border:1px solid #315789;border-radius:10px;box-shadow:0 12px 34px #0005;font:13px/1.35 system-ui,sans-serif;overflow:hidden}
+    #cdca-panel-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#0f274a;cursor:move;touch-action:none;user-select:none}
+    #cdca-panel-head strong{font-size:15px}#cdca-panel-head em{font-size:11px;font-style:normal;color:#a9c9f2}
+    #cdca-minimize{width:28px!important;margin:0!important;padding:3px!important;background:#294d7d!important;font-size:17px}
+    #cdca-panel-body{max-height:calc(100vh - 115px);overflow:auto;padding:11px}#cdca-panel.minimized #cdca-panel-body{display:none}
+    #cdca-panel label{display:block;margin:8px 0 4px;color:#dcecff;font-weight:600}#cdca-panel small{display:block;color:#a9c9f2;white-space:pre-wrap;word-break:break-all;margin-top:3px}
+    #cdca-panel input,#cdca-panel textarea{box-sizing:border-box;width:100%;margin-top:4px;border:1px solid #7295be;border-radius:6px;background:#fff;color:#172033;padding:7px;font:12px/1.35 system-ui,sans-serif}
+    #cdca-panel textarea{height:92px;resize:vertical}#cdca-panel input[type=number]{height:34px}
+    #cdca-panel button,#cdca-modal button{border:0;border-radius:6px;padding:8px 9px;cursor:pointer;background:#315b91;color:#fff;font-weight:600}
+    #cdca-panel-body>button{width:100%;margin:5px 0}#cdca-panel button.primary{background:#1677ff}
+    .cdca-stats{background:#102b50;border-radius:7px;padding:8px 10px}.cdca-stats div{margin:2px 0}.cdca-stats b{color:#8cc8ff}#cdca-task-status{color:#bfe0ff;font-weight:700;margin-top:6px!important}
+    .cdca-pages,.cdca-controls{display:grid;grid-template-columns:1fr 1fr;gap:7px}.cdca-controls{grid-template-columns:1fr 1fr 1fr;margin:5px 0}.cdca-controls button{width:100%}.cdca-pages label{margin-top:5px}
+    #cdca-modal{display:none;position:fixed;inset:0;z-index:2147483647;background:#0009;padding:4vh 4vw;font:14px system-ui,sans-serif}#cdca-modal.open{display:block}
+    .cdca-card{background:#fff;color:#172033;max-width:1000px;height:92vh;margin:auto;border-radius:12px;display:flex;flex-direction:column;overflow:hidden}
+    .cdca-card header,.cdca-card footer{padding:14px 18px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #ddd}.cdca-card footer{border:0;border-top:1px solid #ddd;justify-content:flex-end}
+    #cdca-close{background:#eee!important;color:#333!important;font-size:20px}.cdca-card footer button{min-width:150px}
+    #cdca-preview-body{overflow:auto;padding:18px;display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    #cdca-preview-body label{display:flex;flex-direction:column;gap:4px}#cdca-preview-body span{font-weight:600;color:#536078}
+    #cdca-preview-body textarea{min-height:38px;resize:vertical;border:1px solid #ccd3df;border-radius:6px;padding:7px;font:13px/1.4 system-ui,sans-serif}
+    .cdca-toast{position:fixed;left:50%;bottom:50px;z-index:2147483647;transform:translateX(-50%);background:#172033;color:#fff;padding:10px 18px;border-radius:8px;font:14px system-ui,sans-serif}
+    @media(max-width:700px){#cdca-preview-body{grid-template-columns:1fr}#cdca-panel{right:8px;top:55px;width:min(330px,calc(100vw - 16px))}}
+  `);
+
+  GM_registerMenuCommand('采集并导出当前商品 XLSX', () => {
+    const row = collect();
+    if (!row['产品标题']) return alert('当前页面未识别到商品标题，请确认这是 Cdiscount 商品详情页。');
+    downloadXlsx([row]);
+  });
+  GM_registerMenuCommand('按页面采集列表', collectListPages);
+  GM_registerMenuCommand('导出已采集 XLSX', () => downloadXlsx(getRows()));
+  GM_registerMenuCommand('修改默认设置', editSettings);
+  mount();
+  setTimeout(processVisibleTask, 1800);
+})();
