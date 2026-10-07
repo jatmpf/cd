@@ -1,0 +1,569 @@
+// ==UserScript==
+// @name         MANO 购物车状态导出V1.3
+// @namespace    local.manomano.sku.export
+// @version      1.3.0
+// @description  全部/未获得/获得购物车报价，一键采集、SKU去重、断点继续、XLSX/CSV导出；不修改价格或规则。
+// @match        https://toolbox.manomano.com/*
+// @run-at       document-start
+// @sandbox      raw
+// @grant        none
+// @noframes
+// ==/UserScript==
+
+(function () {
+  'use strict';
+  const VERSION = '1.3.0';
+  const ORIGIN = 'https://browserapi.manomano.com';
+  const PATH = '/product-catalog/offer-pricing/api/v1/offer-automation/rules/plp-rule-items';
+  const DBNAME = 'manomano_readonly_export_v1';
+  const MAX_PAGES = 10000;
+  const iso = () => new Date().toISOString();
+  const fail = message => { throw new Error(message); };
+  const int = x => /^\d+$/.test(String(x)) && Number.isSafeInteger(Number(x));
+  function endpoint(value) {
+    const u = new URL(value, ORIGIN);
+    if (u.origin !== ORIGIN || u.pathname !== PATH || u.username || u.password || u.hash) fail('拒绝访问非商品列表接口');
+    if (!/^\d+$/.test(u.searchParams.get('seller_contract_id') || '')) fail('请求缺少有效店铺ID');
+    for (const k of u.searchParams.keys()) {
+      if (/token|authorization|password|secret|cookie|api.?key/i.test(k)) fail('网址含敏感参数，未保存，请重新识别普通列表请求');
+      if (u.searchParams.getAll(k).length !== 1) fail('请求参数重复，需核对后再采集');
+    }
+    return u;
+  }
+  function pageURL(base, page) {
+    if (!int(page) || Number(page) < 1 || Number(page) > MAX_PAGES) fail('页码超出安全范围');
+    const u = endpoint(base); u.searchParams.set('page', String(page)); u.searchParams.set('limit', '20');
+    return u.href;
+  }
+  function scopeKey(value) {
+    const u = endpoint(value); u.searchParams.delete('page'); u.searchParams.delete('limit');
+    u.searchParams.sort(); return u.href;
+  }
+  function scopeURL(value, mode) {
+    const u = endpoint(value);
+    if (['all','lost','won'].includes(mode)) {
+      // Start from an explicit store-wide query, not a hidden SKU/search/status filter.
+      const fresh=new URL(PATH,ORIGIN);
+      fresh.searchParams.set('seller_contract_id',u.searchParams.get('seller_contract_id'));
+      if(mode!=='all')fresh.searchParams.set('is_best_offer',mode==='won'?'true':'false');
+      return pageURL(fresh.href,1);
+    }
+    if (mode === 'all-status' || mode === 'all-offers') u.searchParams.delete('is_best_offer');
+    if (mode === 'all-offers') u.searchParams.delete('offer_status');
+    if (!['current', 'all-status', 'all-offers'].includes(mode)) fail('未知采集范围');
+    return pageURL(u.href, 1);
+  }
+  function money(x, label) {
+    if (x === null || x === undefined || x === '') return null;
+    if (typeof x !== 'number' || !Number.isFinite(x) || x < 0) fail(`${label}格式异常，本页未保存`);
+    return x;
+  }
+  function filterLabel(url) {
+    const p=endpoint(url).searchParams,parts=[];
+    const sub=p.get('rule_item_sub_status'),status=p.get('rule_item_status');
+    const labels={APPLIED:'已应用',ERROR:'错误',IGNORED_BY_DISCOUNT:'未应用：折扣已生效',IGNORED_BY_MIN_PRICE_ACHIEVED:'已达到最低价'};
+    if(status || sub)parts.push(sub?(labels[sub] || [status,sub].filter(Boolean).join('/')):(labels[status] || status));
+    for(const [k,v] of p) {
+      if(['seller_contract_id','page','limit','rule_item_status','rule_item_sub_status'].includes(k))continue;
+      parts.push(k==='is_best_offer'?(v==='true'?'获得购物车':v==='false'?'未获得购物车':k+'='+v):k==='offer_status'?'商品状态='+v:k+'='+v);
+    }
+    return parts.join('；') || '未设置筛选';
+  }
+  function pricingStatus(ruleItem,offerId) {
+    if(ruleItem==null)return '—';
+    if(typeof ruleItem!=='object' || Array.isArray(ruleItem))fail('报价规则状态格式异常，本页未保存');
+    if(ruleItem.om_offer_id && ruleItem.om_offer_id!==offerId)fail('报价规则与商品不匹配，本页未保存');
+    const status=ruleItem.status,sub=ruleItem.sub_status;
+    if([status,sub].some(v=>v!=null && typeof v!=='string'))fail('报价状态格式异常，本页未保存');
+    // Confirmed from the user's response and filter requests, not inferred from prices.
+    const labels={APPLIED:'已应用',ERROR:'错误',IGNORED_BY_DISCOUNT:'未应用：折扣已生效',IGNORED_BY_MIN_PRICE_ACHIEVED:'已达到最低价'};
+    if(status==='ERROR')return sub && sub!=='ERROR' ? `错误（${sub}）` : '错误';
+    if(sub && sub!=='APPLIED')return labels[sub] || [status,sub].filter(Boolean).join(' / ');
+    if(status==='APPLIED' && sub==='APPLIED')return '已应用';
+    return [status,sub].filter(Boolean).join(' / ') || '未知';
+  }
+  function readPage(data, requestedURL) {
+    const u = endpoint(requestedURL), page = Number(u.searchParams.get('page'));
+    if (!data || !Array.isArray(data.content) || !data.pagination) fail('响应不是商品分页数据，可能需要重新登录');
+    const p = data.pagination;
+    if (!int(p.page) || Number(p.page) !== page || Number(p.limit) !== 20) fail('返回页码或每页条数不符，本页未保存');
+    if (data.content.length > 20) fail('接口返回超过20条，分页规则发生变化');
+    const rows = data.content.map(item => {
+      const x = item && item.plp_item, d = item && item.delivery_information || {};
+      if (!x || typeof x.sku !== 'string' || !x.sku.trim() || typeof x.om_offer_id !== 'string' || !x.om_offer_id) fail('商品缺少SKU或报价ID，本页未保存');
+      const identity = JSON.stringify([x.sku, x.om_offer_id]);
+      for(const [param,field] of [['rule_item_status','status'],['rule_item_sub_status','sub_status']]) {
+        const expectedRule=u.searchParams.get(param);
+        if(expectedRule && item.rule_item?.[field]!==expectedRule)fail('返回的报价状态不符合筛选条件，本页未保存');
+      }
+      if (x.is_best_offer != null && typeof x.is_best_offer !== 'boolean') fail('购物车状态不是布尔值，需更新解析规则');
+      const expected=u.searchParams.get('is_best_offer');
+      if ((expected==='true' || expected==='false') && x.is_best_offer!==(expected==='true')) fail('返回的购物车状态不符合所选范围，本页未保存，请刷新后台后重试');
+      const own = money(x.price, '本店售价'), box = money(x.paybox_price, '购物车价');
+      const ship = money(d.cheapest_shipping_price, '本店运费'), boxShip = money(d.cheapest_shipping_price_best_offer, '购物车运费');
+      let productURL = '';
+      if (x.url) {
+        const link = new URL(x.url, 'https://www.manomano.fr');
+        if (link.origin === 'https://www.manomano.fr' && link.pathname.startsWith('/p/')) productURL = link.href;
+      }
+      return {identity, seller_contract_id: u.searchParams.get('seller_contract_id'), sku: x.sku, om_offer_id: x.om_offer_id,
+        title: typeof x.title === 'string' ? x.title : '', price: own, paybox_price: box,
+        is_best_offer: x.is_best_offer == null ? null : x.is_best_offer,
+        buybox_status: x.is_best_offer === true ? '已获得' : x.is_best_offer === false ? '未获得' : '未知',
+        offer_status: typeof x.offer_status === 'string' ? x.offer_status : '',
+        pricing_status: pricingStatus(item.rule_item,x.om_offer_id),
+        cheapest_shipping_price: ship, cheapest_shipping_price_best_offer: boxShip,
+        own_total: own == null || ship == null ? null : Math.round((own + ship) * 100) / 100,
+        buybox_total: box == null || boxShip == null ? null : Math.round((box + boxShip) * 100) / 100,
+        product_url: productURL, source_page: page, collected_at: iso()};
+    });
+    // These zeros are unknown totals in the real sample, NOT an empty catalogue.
+    const totalHint = int(p.items) && Number(p.items) > 0 ? Number(p.items) : null;
+    const next = p.links && p.links.next;
+    if (next) {
+      const n = endpoint(new URL(next, ORIGIN).href);
+      if (scopeKey(n.href) !== scopeKey(u.href) || Number(n.searchParams.get('page')) !== page + 1 || Number(n.searchParams.get('limit')) !== 20) fail('下一页链接改变了店铺、筛选条件或页码，已停止');
+    }
+    // Preserve exact identities (not a short hash) to detect a server returning the same page forever.
+    const fingerprint = JSON.stringify(rows.map(r => r.identity).sort());
+    return {rows, fingerprint, page, totalHint, declaredNext: next ? new URL(next, ORIGIN).href : null};
+  }
+  function newRun(seedURL, mode, site, id) {
+    const url = scopeURL(seedURL, mode);
+    return {id, version: VERSION, base_url: url, shop: endpoint(url).searchParams.get('seller_contract_id'), site,
+      mode, filters: Object.fromEntries(endpoint(url).searchParams), created_at: iso(), updated_at: iso(),
+      next_page: 1, saved_pages: 0, record_count: 0, duplicate_count: 0, status: 'PAUSED', message: '已创建，尚未采集',
+      completion: '未到末页', total_hint: null, expected_total_verified: false, end_probe_page: null, empty_confirmations: 0,
+      warning: '仅代表指定接口和筛选范围；后台总数不可用时不能证明全店覆盖；不同页不是同一时刻快照。'};
+  }
+  const CSV_COLUMNS = [
+    ['seller_contract_id','店铺合同ID'],['site','站点与市场'],['sku','SKU'],['title','产品名称'],
+    ['own_total','本店最低销售价'],
+    ['paybox_price','购物车售价'],['cheapest_shipping_price_best_offer','购物车最低运费'],['buybox_total','购物车价加最低运费'],
+    ['buybox_status','购物车状态'],['offer_status','商品状态'],['product_url','产品网址'],['collected_at','采集时间UTC'],['pricing_status','报价状态']
+  ];
+  function uniqueRows(rows) {
+    const bySKU=new Map();
+    for(const row of rows) {
+      const key=JSON.stringify([row.seller_contract_id,row.site || '',row.sku]),old=bySKU.get(key);
+      if(!old || String(row.collected_at)>=String(old.collected_at))bySKU.set(key,row);
+    }
+    return [...bySKU.values()].sort((a,b)=>a.sku.localeCompare(b.sku));
+  }
+  function cell(value) {
+    let s = value == null ? '' : String(value);
+    // Formula injection protection for CSV. XLSX uses explicit text cells.
+    if (/^[\s\u0000-\u001f]*[=+@-]/.test(s) || /^[\t\r\n]/.test(s)) s = "'" + s;
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  function csv(rows, run) {
+    return '\ufeff' + CSV_COLUMNS.map(x => cell(x[1])).join(',') + '\r\n' + uniqueRows(rows).map(row => {
+      const out = {...row, site: run.site};
+      return CSV_COLUMNS.map(([key]) => cell(out[key])).join(',');
+    }).join('\r\n') + '\r\n';
+  }
+  // Small dependency-free OOXML writer. ZIP entries use STORE (no network/CDN library).
+  function zipFiles(files) {
+    const encoder=new TextEncoder(),chunks=[],central=[];let offset=0,centralSize=0;
+    const table=Array.from({length:256},(_,n)=>{for(let i=0;i<8;i++)n=(n&1)?0xedb88320^(n>>>1):n>>>1;return n>>>0;});
+    for(const [name,text] of files) {
+      const nameBytes=encoder.encode(name),data=encoder.encode(text);let crc=0xffffffff;
+      for(const b of data)crc=table[(crc^b)&255]^(crc>>>8);crc=(crc^0xffffffff)>>>0;
+      const local=new Uint8Array(30+nameBytes.length),l=new DataView(local.buffer);
+      l.setUint32(0,0x04034b50,true);l.setUint16(4,20,true);l.setUint16(6,0x800,true);l.setUint16(12,33,true);
+      l.setUint32(14,crc,true);l.setUint32(18,data.length,true);l.setUint32(22,data.length,true);l.setUint16(26,nameBytes.length,true);local.set(nameBytes,30);
+      const dir=new Uint8Array(46+nameBytes.length),d=new DataView(dir.buffer);
+      d.setUint32(0,0x02014b50,true);d.setUint16(4,20,true);d.setUint16(6,20,true);d.setUint16(8,0x800,true);d.setUint16(14,33,true);
+      d.setUint32(16,crc,true);d.setUint32(20,data.length,true);d.setUint32(24,data.length,true);d.setUint16(28,nameBytes.length,true);d.setUint32(42,offset,true);dir.set(nameBytes,46);
+      chunks.push(local,data);central.push(dir);offset+=local.length+data.length;centralSize+=dir.length;
+    }
+    const end=new Uint8Array(22),e=new DataView(end.buffer);e.setUint32(0,0x06054b50,true);
+    e.setUint16(8,files.length,true);e.setUint16(10,files.length,true);e.setUint32(12,centralSize,true);e.setUint32(16,offset,true);
+    const result=new Uint8Array(offset+centralSize+22);let cursor=0;
+    for(const c of [...chunks,...central,end]){result.set(c,cursor);cursor+=c.length;}return result;
+  }
+  function xml(value) {
+    // Reject overlong cells rather than silently truncating product data.
+    const s=String(value);if(s.length>32767)fail('某个单元格超过Excel字符上限，请改用CSV导出');
+    return s.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]/g,'').replace(/_x[0-9a-f]{4}_/gi,m=>'_x005F_'+m.slice(1))
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
+  }
+  function xlsx(rows,run) {
+    const clean=uniqueRows(rows),ns='http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+    const rel='http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+    const declaration='<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+    const line=(values,r)=>'<row r="'+r+'">'+values.map((v,i)=>{
+      const ref=String.fromCharCode(65+i)+r;
+      if(v==null)return `<c r="${ref}"/>`;
+      if(typeof v==='number')return `<c r="${ref}" s="2" t="n"><v>${v}</v></c>`;
+      return `<c r="${ref}"${r===1?' s="1"':''} t="inlineStr"><is><t xml:space="preserve">${xml(v)}</t></is></c>`;
+    }).join('')+'</row>';
+    const data=[line(CSV_COLUMNS.map(c=>c[1]),1)];
+    for(let i=0;i<clean.length;i++)data.push(line(CSV_COLUMNS.map(([key])=>key==='site'?run.site:clean[i][key]),i+2));
+    const last=String.fromCharCode(64+CSV_COLUMNS.length)+(clean.length+1),widths=[18,16,26,58,22,18,22,26,16,16,60,28,38];
+    const sheet=declaration+`<worksheet xmlns="${ns}"><dimension ref="A1:${last}"/><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="20"/><cols>`+
+      widths.map((w,i)=>`<col min="${i+1}" max="${i+1}" width="${w}" customWidth="1"/>`).join('')+'</cols><sheetData>'+data.join('')+`</sheetData><autoFilter ref="A1:${last}"/></worksheet>`;
+    return zipFiles([
+      ['[Content_Types].xml',declaration+'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>'],
+      ['_rels/.rels',declaration+`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>`],
+      ['xl/workbook.xml',declaration+`<workbook xmlns="${ns}" xmlns:r="${rel}"><sheets><sheet name="购物车状态" sheetId="1" r:id="rId1"/></sheets></workbook>`],
+      ['xl/_rels/workbook.xml.rels',declaration+`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${rel}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="${rel}/styles" Target="styles.xml"/></Relationships>`],
+      ['xl/styles.xml',declaration+`<styleSheet xmlns="${ns}"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF007F6B"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/><xf numFmtId="2" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`],
+      ['xl/worksheets/sheet1.xml',sheet]
+    ]);
+  }
+  function exportFile(rows,run,name,save,writer=xlsx) {
+    try {
+      save(name+'.xlsx',writer(rows,run),'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      return 'XLSX';
+    } catch {
+      try {save(name+'.csv',csv(rows,run),'text/csv;charset=utf-8');return 'CSV';}
+      catch {fail('XLSX和CSV均未能生成下载，数据仍保存在本地，请稍后点击“保存当前结果”重试');}
+    }
+  }
+  class Runner {
+    constructor({store, request, delay, onUpdate = () => {}}) { this.store=store;this.request=request;this.delay=delay;this.onUpdate=onUpdate;this.stop=false; }
+    pause() { this.stop=true; }
+    async run(id, count, interval) {
+      validateSettings(count,interval);
+      this.stop=false;let run=await this.store.getRun(id), n=0;
+      if (!run || run.status === 'END_REACHED') fail('没有可继续的采集');
+      await this.store.patchRun(id,{status:'RUNNING',message:'正在采集'});
+      try {
+        while (!this.stop && n<count) {
+          run=await this.store.getRun(id);
+          if (run.next_page > MAX_PAGES) fail('达到安全页数上限，未标记完成');
+          const url=pageURL(run.base_url,run.next_page);
+          this.onUpdate({...run,requesting_page:run.next_page});
+          const parsed=readPage(await this.request(url),url);
+          if (this.stop) break; // aborted requests never advance the checkpoint
+          if (!parsed.rows.length) {
+            await this.delay(interval);
+            if (this.stop) break;
+            const again=readPage(await this.request(url),url);
+            if (this.stop) break;
+            if (again.rows.length) fail('同一页先空后非空，数据正在变化；请稍后续采');
+            await this.store.patchRun(id,{status:'END_REACHED',message:'连续两次返回空页，扫描结束；总数未核验',
+              completion:'连续两次空页',end_probe_page:run.next_page,empty_confirmations:2,expected_total_verified:false});
+            this.onUpdate(await this.store.getRun(id));return 'end';
+          }
+          await this.store.commitPage(id,parsed);
+          n++;this.onUpdate(await this.store.getRun(id));
+          if (!this.stop && n<count) await this.delay(interval);
+        }
+        await this.store.patchRun(id,{status:'PAUSED',message:this.stop?'已暂停，点击“继续导出”可接着采集':'已达到填写的页数，可保存结果或继续导出'});
+        this.onUpdate(await this.store.getRun(id));return this.stop?'paused':'limit';
+      } catch(e) {
+        await this.store.patchRun(id,{status:'PAUSED',message:this.stop?'已暂停，未完成页将在续采时重试':String(e.message || '采集失败').slice(0,240)});
+      }
+      this.onUpdate(await this.store.getRun(id));
+      return this.stop?'paused':'error';
+    }
+  }
+  function validateSettings(count,interval) {
+    if (!(count===Infinity || Number.isInteger(count) && count>=1 && count<=MAX_PAGES)) fail('页数请留空（全部）或填写1至10000的整数');
+    if (!Number.isFinite(interval) || interval<1000 || interval>3600000) fail('每页间隔请输入1至3600秒');
+  }
+
+  class Store {
+    async open() {
+      if (this.db) return;
+      this.db=await new Promise((resolve,reject)=>{
+        const r=indexedDB.open(DBNAME,1);
+        r.onupgradeneeded=()=>{
+          const db=r.result;db.createObjectStore('runs',{keyPath:'id'});
+          const rows=db.createObjectStore('rows',{keyPath:'key'});rows.createIndex('run_id','run_id');
+          const pages=db.createObjectStore('pages',{keyPath:'key'});pages.createIndex('fingerprint',['run_id','fingerprint'],{unique:true});
+        };
+        r.onerror=()=>reject(new Error('无法打开本地数据库，请检查紫鸟存储权限'));
+        r.onblocked=()=>reject(new Error('本地数据库被其他标签占用，请关闭重复标签'));
+        r.onsuccess=()=>resolve(r.result);
+      });
+      this.db.onversionchange=()=>this.db.close();
+    }
+    async read(store,method,...args) {
+      await this.open();return new Promise((resolve,reject)=>{
+        const tx=this.db.transaction(store,'readonly'),r=tx.objectStore(store)[method](...args);
+        r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(new Error('本地数据读取失败'));
+      });
+    }
+    getRun(id) { return this.read('runs','get',id); }
+    async listRuns() { return (await this.read('runs','getAll')).sort((a,b)=>b.created_at.localeCompare(a.created_at)); }
+    async patchRun(id,patch) {
+      await this.open();return new Promise((resolve,reject)=>{
+        const tx=this.db.transaction('runs','readwrite'),s=tx.objectStore('runs'),r=s.get(id);
+        r.onsuccess=()=>{if (!r.result) {tx.abort();return;} s.put({...r.result,...patch,updated_at:iso()});};
+        tx.oncomplete=resolve;tx.onabort=()=>reject(new Error('保存采集进度失败'));tx.onerror=()=>{};
+      });
+    }
+    async addRun(run) {
+      await this.open();return new Promise((resolve,reject)=>{
+        const tx=this.db.transaction('runs','readwrite');tx.objectStore('runs').add(run);
+        tx.oncomplete=resolve;tx.onabort=()=>reject(new Error('无法开始采集，可能存储空间不足'));tx.onerror=()=>{};
+      });
+    }
+    async replaceRun(run) {
+      await this.open();return new Promise((resolve,reject)=>{
+        const tx=this.db.transaction(['runs','rows','pages'],'readwrite');
+        for(const name of ['runs','rows','pages'])tx.objectStore(name).clear();
+        tx.objectStore('runs').add(run);
+        tx.oncomplete=resolve;tx.onabort=()=>reject(new Error('新采集未能保存，之前的数据未清除'));tx.onerror=()=>{};
+      });
+    }
+    async clearData() {
+      await this.open();return new Promise((resolve,reject)=>{
+        const tx=this.db.transaction(['runs','rows','pages'],'readwrite');
+        for(const name of ['runs','rows','pages'])tx.objectStore(name).clear();
+        tx.oncomplete=resolve;tx.onabort=()=>reject(new Error('清除未成功，原数据保留'));tx.onerror=()=>{};
+      });
+    }
+    async commitPage(id,page) {
+      await this.open();return new Promise((resolve,reject)=>{
+        const tx=this.db.transaction(['runs','rows','pages'],'readwrite');let problem='保存失败（可能存储空间不足），未推进页码';
+        const runs=tx.objectStore('runs'),rows=tx.objectStore('rows'),pages=tx.objectStore('pages');
+        const r=runs.get(id);
+        r.onsuccess=()=>{
+          const run=r.result;
+          if (!run || run.next_page!==page.page) {problem='断点页码冲突，请关闭重复采集标签';tx.abort();return;}
+          const seen=pages.index('fingerprint').get([id,page.fingerprint]);
+          seen.onsuccess=()=>{
+            if (seen.result) {problem='服务器重复返回之前的整页，已停止防止无限循环';tx.abort();return;}
+            const unique=new Map();for(const row of page.rows)unique.set(JSON.stringify([row.seller_contract_id,row.sku]),row);
+            let finished=0,added=0,duplicates=page.rows.length-unique.size;
+            for (const row of unique.values()) {
+              const key=JSON.stringify([id,row.seller_contract_id,row.sku]),existing=rows.get(key);
+              existing.onsuccess=()=>{
+                if(existing.result)duplicates++;else added++;
+                rows.put({...row,key,run_id:id,site:run.site,first_seen_at:existing.result?.first_seen_at || row.collected_at});
+                if (++finished===unique.size) {
+                  pages.add({key:JSON.stringify([id,page.page]),run_id:id,page:page.page,fingerprint:page.fingerprint,records:page.rows.length,saved_at:iso()});
+                  runs.put({...run,next_page:page.page+1,saved_pages:run.saved_pages+1,record_count:run.record_count+added,
+                    duplicate_count:run.duplicate_count+duplicates,total_hint:page.totalHint || run.total_hint,updated_at:iso(),
+                    message:`已保存第 ${page.page} 页${duplicates?'；重复SKU已合并，保留后采集的数据':''}`});
+                }
+              };
+            }
+          };
+        };
+        tx.oncomplete=resolve;tx.onabort=()=>reject(new Error(problem));tx.onerror=()=>{};
+      });
+    }
+    async getRows(id) {
+      await this.open();return new Promise((resolve,reject)=>{
+        const tx=this.db.transaction('rows','readonly'),r=tx.objectStore('rows').index('run_id').getAll(IDBKeyRange.only(id));
+        r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(new Error('导出读取失败'));
+      });
+    }
+  }
+
+  // Exports exist only in Node tests. No credentials or helpers are exposed on window.
+  if (typeof module === 'object' && module.exports && typeof window === 'undefined') {
+    module.exports={VERSION,ORIGIN,PATH,endpoint,pageURL,scopeKey,scopeURL,readPage,newRun,Runner,Store,csv,xlsx,exportFile,uniqueRows,validateSettings,CSV_COLUMNS,cell,filterLabel};return;
+  }
+  if (window.top !== window.self) return;
+  const instanceKey=Symbol.for('local.manomano.readonly.export.v1');
+  if (window[instanceKey]) return;
+  window[instanceKey]=true;
+
+  const originalFetch=window.fetch.bind(window),store=new Store();
+  let session=null,runner=null,active=false,controller=null,selected=null,panel=null,busy=false,currentPage=null;
+  let latestListRequest=0;
+  let notice='等待识别：请刷新后台商品列表或向下滚动，触发一次正常加载。';
+  const xhrData=new WeakMap();
+  function isList(url,method) {
+    try {endpoint(url);return String(method || 'GET').toUpperCase()==='GET';} catch {return false;}
+  }
+  function replayHeaders(source) {
+    const h=new Headers(source);
+    for (const k of [...h.keys()]) if (/^(cookie|host|origin|referer|content-length|connection|sec-|proxy-)/i.test(k)) h.delete(k);
+    h.set('Accept','application/json');return h;
+  }
+  function captured(url,headers,credentials) {
+    try {
+      const normalized=endpoint(url).href;
+      if (session && scopeKey(normalized)!==scopeKey(session.url) && active) pause('后台店铺或筛选已变化，采集已暂停');
+      session={url:normalized,headers:replayHeaders(headers),credentials:credentials || 'same-origin'};
+      notice=`已识别店铺 ${endpoint(url).searchParams.get('seller_contract_id')}。当前筛选：${filterLabel(normalized)}`;
+      render();
+    } catch {notice='列表请求未能安全识别，请重新刷新后台列表';render();}
+  }
+  function observing(url) {
+    if(session && scopeKey(url)!==scopeKey(session.url) && active)pause('后台筛选已变化，当前导出已暂停');
+    session=null;notice='正在识别后台筛选，请等待列表加载完成。';render();return ++latestListRequest;
+  }
+  // Observe only this exact GET endpoint. Credentials are never written to IndexedDB or exports.
+  window.fetch=function(input,init) {
+    let info=null;
+    try {
+      const req=input instanceof Request?input:null,url=req?req.url:String(input),method=init?.method || req?.method || 'GET';
+      if (isList(url,method)) info={url,headers:new Headers(init?.headers || req?.headers || {}),credentials:init?.credentials || req?.credentials || 'same-origin'};
+    } catch {}
+    if(info)info.serial=observing(info.url);
+    const promise=originalFetch(input,init);
+    if(info) promise.then(response=>{
+      if(response.status===200) response.clone().json().then(data=>{
+        if(info.serial!==latestListRequest)return;
+        readPage(data,info.url);captured(info.url,info.headers,info.credentials);
+      }).catch(()=>{});
+    }).catch(()=>{});
+    return promise;
+  };
+  const xo=XMLHttpRequest.prototype.open,xh=XMLHttpRequest.prototype.setRequestHeader,xs=XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open=function(method,url,...args) {
+    if(isList(String(url),method))xhrData.set(this,{method,url:String(url),headers:new Headers()});else xhrData.delete(this);
+    return xo.call(this,method,url,...args);
+  };
+  XMLHttpRequest.prototype.setRequestHeader=function(k,v) {const d=xhrData.get(this);if(d)d.headers.append(k,v);return xh.call(this,k,v);};
+  XMLHttpRequest.prototype.send=function(...args) {
+    const d=xhrData.get(this);
+    if(d && isList(d.url,d.method)) {const serial=observing(d.url);this.addEventListener('load',()=>{
+      if(serial!==latestListRequest)return;
+      try {if(this.status!==200)return;const data=this.responseType==='json'?this.response:JSON.parse(this.responseText);
+        readPage(data,d.url);captured(d.url,d.headers,this.withCredentials?'include':'same-origin');}catch{}
+    },{once:true});}
+    return xs.apply(this,args);
+  };
+
+  function pause(message='已请求暂停；当前未完成页不会推进断点') {
+    if(runner)runner.pause();if(controller)controller.abort();notice=message;render();
+  }
+  async function request(url) {
+    const u=endpoint(url);
+    if(!session || u.searchParams.get('seller_contract_id')!==endpoint(session.url).searchParams.get('seller_contract_id')) fail('请先在对应店铺刷新列表，重新识别当前登录会话');
+    controller=new AbortController();const timeout=setTimeout(()=>controller?.abort(),45000);
+    try {
+      const r=await originalFetch(u.href,{method:'GET',headers:new Headers(session.headers),credentials:session.credentials,
+        signal:controller.signal,redirect:'error',cache:'no-store'});
+      if(r.status===401 || r.status===403) fail(`HTTP ${r.status}：登录过期或访问被拒绝。请手动登录/验证后刷新列表，再续采。`);
+      if(r.status===429) fail('HTTP 429：后台限流，已暂停。请稍后加大间隔再续采。');
+      if(r.status!==200) fail(`HTTP ${r.status}：本页未保存，未标记完成`);
+      if(!r.headers.get('content-type')?.toLowerCase().includes('json')) fail('返回了非JSON页面，可能需要手动登录或验证');
+      const body=await r.text();if(body.length>5000000)fail('单页响应过大，未保存');
+      try{return JSON.parse(body);}catch{fail('JSON响应不完整，本页未保存');}
+    } catch(e) {
+      if(e.name==='AbortError')fail('请求取消或45秒超时，本页未保存');
+      if(e instanceof TypeError)fail('请求未成功，可能是网络或浏览器跨域限制；请刷新列表后续采，不要提供Cookie');
+      throw e;
+    } finally {clearTimeout(timeout);controller=null;}
+  }
+  async function delay(ms) {
+    const until=Date.now()+ms;
+    while(Date.now()<until && runner && !runner.stop) await new Promise(r=>setTimeout(r,Math.min(100,until-Date.now())));
+  }
+  async function launch(mode=null) {
+    if(active || busy)return;
+    if(!session) {notice='请先刷新后台商品列表或滚动一批，等面板显示“已识别店铺”。';render();return;}
+    if(!navigator.locks)fail('当前浏览器不支持采集互斥锁，请升级紫鸟内核后再试');
+    const count=panel.pages.value.trim()===''?Infinity:Number(panel.pages.value),interval=Number(panel.interval.value)*1000;
+    validateSettings(count,interval);busy=true;await render();
+    try {
+      await navigator.locks.request(DBNAME+':collector',{ifAvailable:true},async lock=>{
+        if(!lock)fail('另一个标签正在采集，请先在那个标签暂停');
+        let run;
+        if(mode) {
+          run=newRun(session.url,mode,'FR / B2C',crypto.randomUUID());
+          await store.replaceRun(run);selected=run.id;
+        } else {
+          run=await store.getRun(selected);
+          if(!run)fail('还没有可继续的采集，请先点击上面的导出报价按钮');
+          if(run.version!==VERSION)fail('旧版缓存不兼容，请点击上面的导出报价按钮重新采集');
+          if(run.shop!==endpoint(session.url).searchParams.get('seller_contract_id'))fail('当前店铺与待继续的采集不一致，请切回原店铺');
+          if(run.status==='END_REACHED')fail('上次已扫描结束。重新采集请点击上面的导出报价按钮');
+        }
+        active=true;currentPage=run.next_page;notice='正在导出，请勿刷新或关闭页面。';
+        runner=new Runner({store,request,delay,onUpdate:r=>{currentPage=r.requesting_page || r.saved_pages || r.next_page;render();}});await render();
+        let outcome;
+        try {outcome=await runner.run(run.id,count,interval);}finally{active=false;runner=null;await render();}
+        if(outcome==='end' || outcome==='limit')await exportData(run.id);
+        else {notice='采集已暂停。可点击“继续导出”，或“保存当前结果”下载已采集的数据。';await render();}
+      });
+    } finally {busy=false;await render();}
+  }
+  function download(name,text,type) {
+    const blob=new Blob([text],{type}),url=URL.createObjectURL(blob),a=document.createElement('a');
+    a.href=url;a.download=name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);
+  }
+  async function exportData(id=selected) {
+    if(active)fail('请先暂停采集，再导出一致的数据快照');
+    const run=await store.getRun(id);if(!run)fail('还没有可保存的采集结果');
+    const rows=uniqueRows(await store.getRows(id));
+    if(!rows.length && run.status!=='END_REACHED')fail('还没有保存数据，请先开始采集');
+    const condition=run.mode==='current'?'_'+filterLabel(run.base_url).replace(/[<>:"/\\|?*\u0000-\u001f]/g,'_').slice(0,70):'';
+    const name=`MANO购物车状态_${run.shop}_${modeLabel(run.mode)}${condition}_${run.status==='END_REACHED'?'扫描结束_总数未核验':'部分数据'}_${iso().replace(/[:.]/g,'-')}`;
+    const format=exportFile(rows,run,name,download);
+    notice=`${format==='CSV'?'XLSX失败，已自动改为CSV。':'XLSX已生成。'}共 ${rows.length} 条，请查看下载列表。${run.status==='END_REACHED'?'扫描结束，总数未核验。':'当前为部分数据。'}`;render();
+  }
+  function modeLabel(mode) {return {all:'全部报价',lost:'未获得购物车报价',won:'获得购物车报价',current:'当前筛选报价'}[mode] || '旧版采集';}
+  async function clearData() {
+    if(active || busy)fail('请先暂停采集，再清除数据');
+    if(!navigator.locks)fail('当前浏览器不支持安全清除，请升级内核');
+    busy=true;await render();
+    try {await navigator.locks.request(DBNAME+':collector',{ifAvailable:true},async lock=>{
+      if(!lock)fail('其他标签正在采集，请先暂停');
+      if(!confirm('清除当前采集数据和续采进度？清除后无法恢复，已下载的表格不受影响。')){notice='已取消清除，采集数据保留。';return;}
+      await store.clearData();selected=null;currentPage=null;notice='采集数据和进度已清除，可以开始新的导出。';
+    });}finally{busy=false;await render();}
+  }
+  async function action(fn) {try{await fn();}catch(e){notice=String(e.message || '操作失败').slice(0,240);render();}}
+  function mount() {
+    if(!document.body)return;
+    const host=document.createElement('div');host.id='manomano-readonly-export-panel';
+    host.style.cssText='position:fixed;right:16px;bottom:16px;z-index:2147483646;';
+    const shadow=host.attachShadow({mode:'closed'});
+    shadow.innerHTML=`<style>
+      :host{font:13px/1.55 Arial,"Microsoft YaHei",sans-serif;color:#183343}*{box-sizing:border-box}
+      section{width:370px;max-height:85vh;overflow:auto;background:#fff;border:1px solid #bed9d3;border-radius:12px;box-shadow:0 8px 32px #102f3733;padding:15px}
+      header{display:flex;justify-content:space-between;align-items:center;font-weight:bold;font-size:16px;color:#006956}
+      .tag{font-size:11px;color:#677b83}p{margin:9px 0;overflow-wrap:anywhere}label{display:block;margin:9px 0 3px}
+      select,input{width:100%;padding:6px;border:1px solid #bed0d5;border-radius:5px;background:white;color:#183343}
+      button{border:1px solid #aac9c0;border-radius:5px;background:#f1faf7;color:#164c42;padding:7px 9px;cursor:pointer;margin:4px 3px 0 0}
+      button.primary{background:#007f6b;color:white}button:disabled{opacity:.45;cursor:default}.row{display:flex;gap:8px}.row>div{flex:1}
+      .status{background:#eef7f5;padding:8px;border-radius:6px;white-space:pre-line}.warn{font-size:12px;color:#865400}small{color:#677b83}
+      .hidden{display:none}#minimize{padding:1px 7px;margin:0}
+    </style><section><header>MANO 购物车状态导出 <button id="minimize">收起</button></header><div id="body">
+      <div class="tag">v${VERSION}</div>
+      <button id="all" class="primary">导出全部报价</button>
+      <button id="lost">导出未获得购物车报价</button><button id="won">导出获得购物车报价</button>
+      <button id="current" class="primary">导出当前筛选报价</button>
+      <div class="row"><div><label>导出页数（默认全部）</label><input id="pages" type="number" min="1" max="10000" step="1" placeholder="全部；可填100、200"></div>
+      <div><label>每页间隔（秒）</label><input id="interval" type="number" min="1" max="3600" step="0.1" value="1"></div></div>
+      <p id="notice"></p>
+      <p id="stats" class="status">尚未开始采集</p>
+      <button id="continue">继续导出</button><button id="pause">暂停采集</button><button id="save">保存当前结果</button><button id="clear">清除数据</button>
+      <small>条件导出：先在后台选状态，等“当前筛选”更新后点“导出当前筛选报价”。每次导出均替换旧缓存；中断后点“继续导出”。导出期间勿刷新、关闭页面或切换店铺。</small>
+      </div></section>`;
+    document.body.append(host);panel={};
+    for(const id of ['notice','pages','interval','all','lost','won','current','stats','continue','pause','save','clear'])panel[id]=shadow.getElementById(id);
+    shadow.getElementById('minimize').onclick=()=>{const b=shadow.getElementById('body');b.classList.toggle('hidden');shadow.getElementById('minimize').textContent=b.classList.contains('hidden')?'展开':'收起';};
+    for(const mode of ['all','lost','won','current'])panel[mode].onclick=()=>action(()=>launch(mode));
+    panel.continue.onclick=()=>action(()=>launch());panel.pause.onclick=()=>pause();
+    panel.save.onclick=()=>action(()=>exportData());
+    panel.clear.onclick=()=>action(clearData);
+    render();
+  }
+  let renderToken=0;
+  async function render() {
+    if(!panel)return;const token=++renderToken;
+    panel.notice.textContent=notice;
+    try {
+      const runs=await store.listRuns();if(token!==renderToken)return;
+      if(!selected && runs.length)selected=runs[0].id;
+      const run=runs.find(r=>r.id===selected);
+      const compatible=run && run.version===VERSION;
+      panel.stats.textContent=compatible?`店铺：${run.shop} · ${modeLabel(run.mode)}${run.mode==='current'?'\n筛选：'+filterLabel(run.base_url):''}\n${active?'正在采集':'已保存到'}第 ${active?(currentPage || run.next_page):run.saved_pages} 页\n总共有 ${run.record_count} 条（已去重） · 重复 ${run.duplicate_count} 条\n${!active && run.status==='RUNNING'?'上次中断，点击“继续导出”接着采集':run.message}`:'尚未开始采集';
+      for(const id of ['pages','interval'])panel[id].disabled=active || busy;
+      for(const id of ['all','lost','won','current'])panel[id].disabled=active || busy || !session;
+      panel.continue.disabled=active || busy || !compatible || !session || run.status==='END_REACHED';
+      panel.save.disabled=active || busy || !compatible || (!run.record_count && run.status!=='END_REACHED');panel.pause.disabled=!active;
+      panel.clear.disabled=active || busy || !runs.length;
+    } catch {panel.stats.textContent='本地数据库不可用。未开始采集，请检查紫鸟是否允许网站存储。';for(const id of ['all','lost','won','current','continue','save'])panel[id].disabled=true;}
+  }
+  function routeVisible() {
+    const visible=location.pathname.startsWith('/catalog/pricing-rules');
+    if(!visible && active)pause('已离开定价页面，采集已暂停，回到页面后可继续');
+    const host=document.getElementById('manomano-readonly-export-panel');if(host)host.hidden=!visible;
+  }
+  if(document.body)mount();else document.addEventListener('DOMContentLoaded',mount,{once:true});
+  setInterval(routeVisible,1500);
+  window.addEventListener('beforeunload',event=>{if(active){event.preventDefault();event.returnValue='采集未结束，已保存页面可续采。';}});
+})();
