@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Cdiscount CD 采集助手
 // @namespace    codex.cdiscount.collector
-// @version      2.1.4
-// @description  可见页面逐条采集 Cdiscount 商品，支持人工验证、暂停恢复，并导出 XLSX。
-// @author       小虫
+// @version      2.2.0
+// @description  可见页面逐条采集 Cdiscount 商品，支持人工验证、断点续传、网址回填及大批量 XLSX 导出。
+// @author       Codex
 // @match        https://www.cdiscount.com/*
 // @grant        GM_addStyle
 // @grant        GM_setValue
@@ -449,6 +449,19 @@
     batch.stopped = !task?.active;
     batch.running = !!task?.active && !task?.paused;
     updateBatchStats();
+    syncTaskInputs(task);
+  }
+
+  function syncTaskInputs(task = getVisibleTask()) {
+    if (!task) return;
+    const listInput = $('#cdca-list-url');
+    const startInput = $('#cdca-start-page');
+    const endInput = $('#cdca-end-page');
+    const urlInput = $('#cdca-url-input');
+    if (listInput && task.baseUrl) listInput.value = task.baseUrl;
+    if (startInput && task.startPage) startInput.value = task.startPage;
+    if (endInput && task.endPage) endInput.value = task.endPage;
+    if (urlInput && Array.isArray(task.urls) && task.urls.length) urlInput.value = task.urls.join('\n');
   }
 
   function samePage(a, b) {
@@ -498,7 +511,7 @@
   function startVisibleProducts(urls) {
     const list = uniqueProductUrls(urls || []);
     if (!list.length) return alert('没有识别到有效的 Cdiscount 商品网址。');
-    const task = { active: true, paused: false, waiting: false, phase: 'products', urls: list, index: 0, success: 0, failed: 0 };
+    const task = { active: true, paused: false, waiting: false, completed: false, phase: 'products', urls: list, index: 0, success: 0, failed: 0 };
     saveVisibleTask(task);
     goVisible(list[0]);
   }
@@ -529,7 +542,8 @@
         return setTimeout(processVisibleTask, 3000);
       }
       task.waiting = false;
-      task.urls = unique([...(task.urls || []), ...found]);
+      task.urls = uniqueProductUrls([...(task.urls || []), ...found]);
+      task.lastCompletedPage = task.currentPage;
       if (task.currentPage < task.endPage) {
         task.currentPage++;
         saveVisibleTask(task);
@@ -539,14 +553,14 @@
         task.active = false; saveVisibleTask(task);
         return alert('指定页面范围没有识别到商品链接。');
       }
-      task.phase = 'products'; task.index = 0;
+      task.phase = 'products'; task.index = 0; task.listFinished = true;
       saveVisibleTask(task);
       return goVisible(task.urls[0], 1200);
     }
 
     const url = task.urls[task.index];
     if (!url) {
-      task.active = false; task.waiting = false; saveVisibleTask(task);
+      task.active = false; task.waiting = false; task.completed = true; saveVisibleTask(task);
       progress('采集完成', `成功 ${task.success}，失败 ${task.failed}`);
       return alert(`采集完成：成功 ${task.success} 条，失败 ${task.failed} 条。`);
     }
@@ -580,20 +594,53 @@
     const startPage = Math.max(1, parseInt($('#cdca-start-page').value, 10) || 1);
     const endPage = Math.min(200, Math.max(startPage, parseInt($('#cdca-end-page').value, 10) || startPage));
     if (!baseUrl) return alert('请输入有效的 Cdiscount 列表页网址。');
-    const task = { active: true, paused: false, waiting: false, phase: 'lists', baseUrl, startPage, endPage, currentPage: startPage, urls: [], index: 0, success: 0, failed: 0 };
+    const task = { active: true, paused: false, waiting: false, completed: false, phase: 'lists', baseUrl, startPage, endPage, currentPage: startPage, lastCompletedPage: startPage - 1, urls: [], index: 0, success: 0, failed: 0 };
     saveVisibleTask(task);
     goVisible(pageUrl(baseUrl, startPage));
   }
 
-  function downloadXlsx(rows) {
-    if (!rows.length) return alert('采集列表为空，请先添加商品。');
-    const data = rows.map(row => Object.fromEntries(HEADERS.map(h => [h, h === 'SKU' ? '' : (row[h] ?? '')])));
-    const ws = XLSX.utils.json_to_sheet(data, { header: HEADERS });
-    ws['!cols'] = HEADERS.map((h, i) => ({ wch: i >= 21 ? 32 : Math.max(12, h.length * 2 + 2) }));
-    ws['!autofilter'] = { ref: `A1:AD${rows.length + 1}` };
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
-    XLSX.writeFile(wb, `CD采集_${new Date().toISOString().slice(0, 10)}.xlsx`, { compression: true });
+  function excelSafeValue(value) {
+    if (value === null || value === undefined) return '';
+    if (typeof value !== 'string') return value;
+    return value.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '').slice(0, 32767);
+  }
+
+  async function downloadXlsx(rows) {
+    if (!rows?.length) return alert('采集列表为空，请先添加商品。');
+    if (typeof XLSX === 'undefined') return alert('XLSX 导出组件没有加载，请检查网络后刷新页面再试。');
+    const button = $('#cdca-export');
+    if (button) { button.disabled = true; button.textContent = '正在生成 XLSX…'; }
+    progress('正在生成 XLSX', `正在整理 ${rows.length} 条数据，请不要关闭页面`);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    try {
+      const data = rows.map(row => Object.fromEntries(HEADERS.map(h => [h, h === 'SKU' ? '' : excelSafeValue(row[h])])));
+      const ws = XLSX.utils.json_to_sheet(data, { header: HEADERS });
+      ws['!cols'] = HEADERS.map((h, i) => ({ wch: i >= 21 ? 32 : Math.max(12, h.length * 2 + 2) }));
+      ws['!autofilter'] = { ref: `A1:AD${rows.length + 1}` };
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
+      const bytes = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
+      const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const now = new Date();
+      const stamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`;
+      link.href = objectUrl;
+      link.download = `CD采集_${stamp}_${rows.length}条.xlsx`;
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+      progress('XLSX 已生成', `已导出 ${rows.length} 条数据，请查看浏览器下载记录`);
+      toast(`已导出 ${rows.length} 条数据`);
+    } catch (error) {
+      console.error('[CD采集助手] XLSX 导出失败', error);
+      progress('XLSX 导出失败', error?.message || String(error));
+      alert(`导出失败：${error?.message || error}\n采集数据仍然保存在 Tampermonkey 中。`);
+    } finally {
+      if (button) { button.disabled = false; button.textContent = '导出全部 XLSX'; }
+    }
   }
 
   function renderPreview(row) {
@@ -645,7 +692,7 @@
   function mount() {
     document.body.insertAdjacentHTML('beforeend', `
       <div id="cdca-panel">
-        <div id="cdca-panel-head"><strong>CD 批量采集助手 <em>v2.1.4 可见采集</em></strong><button id="cdca-minimize" title="最小化">－</button></div>
+        <div id="cdca-panel-head"><strong>CD 批量采集助手 <em>v2.2.0 断点续传</em></strong><button id="cdca-minimize" title="最小化">－</button></div>
         <div id="cdca-panel-body">
           <div class="cdca-stats">
             <div>当前已收集链接：<b id="cdca-link-count">0</b></div><div>当前已采集数据：<b id="cdca-count">0</b></div>
@@ -658,7 +705,7 @@
           <label>直接粘贴商品网址（每行一个）<textarea id="cdca-url-input" placeholder="https://www.cdiscount.com/.../商品.html"></textarea></label>
           <button id="cdca-url-start">开始可见采集网址</button>
           <button id="cdca-preview">采集并导出当前商品 XLSX</button>
-          <div class="cdca-controls"><button id="cdca-pause">暂停</button><button id="cdca-resume">恢复</button><button id="cdca-stop">停止</button></div>
+          <div class="cdca-controls"><button id="cdca-pause">暂停</button><button id="cdca-resume">恢复/续传</button><button id="cdca-stop">停止</button></div>
           <button id="cdca-export" class="primary">导出全部 XLSX</button>
           <div class="cdca-controls"><button id="cdca-settings">默认设置</button><button id="cdca-clear">清空列表</button></div>
         </div>
@@ -680,8 +727,9 @@
     };
     $('#cdca-resume').onclick = () => {
       const task = getVisibleTask();
-      if (!task?.active) return toast('没有可恢复的任务');
-      task.paused = false; task.waiting = false; saveVisibleTask(task); processVisibleTask();
+      if (!task) return toast('没有可恢复的任务');
+      if (task.completed || (task.phase === 'products' && task.index >= (task.urls?.length || 0))) return toast('上次任务已经全部完成');
+      task.active = true; task.paused = false; task.waiting = false; saveVisibleTask(task); processVisibleTask();
     };
     $('#cdca-stop').onclick = () => {
       const task = getVisibleTask();
@@ -697,6 +745,14 @@
     makePanelMovable();
     updateCount();
     updateBatchStats();
+    const savedTask = getVisibleTask();
+    syncTaskInputs(savedTask);
+    if (savedTask && !savedTask.active && !savedTask.completed) {
+      const checkpoint = savedTask.phase === 'lists'
+        ? `列表第 ${savedTask.currentPage || savedTask.startPage || 1} 页`
+        : `商品 ${(savedTask.index || 0) + 1}/${savedTask.urls?.length || 0}`;
+      progress('检测到可续传任务', `断点位置：${checkpoint}，点击“恢复/续传”继续`);
+    }
   }
 
   function makePanelMovable() {
