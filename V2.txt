@@ -1,3 +1,4 @@
+yaml
 mixed-port: 7890
 allow-lan: true
 bind-address: '*'
