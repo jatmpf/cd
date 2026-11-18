@@ -14,8 +14,8 @@ dns:
     - 223.5.5.5
     - 119.29.29.29
   fallback:
-    - https://1.1.1
-    - https://8.8.8
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
 
 proxies:
   - name: "JMS-1501320@c87s2"
@@ -27,7 +27,7 @@ proxies:
     tls: true
     udp: true
     flow: xtls-rprx-vision
-    servername: ://citygrainla.com
+    servername: portal.citygrainla.com
     reality-opts:
       public-key: BlSccfT5tvDIOS7v9VaPd0ulUNhUdvlMjGiNzDNDUHE
       short-id: 051f20c2344a2dfd
@@ -42,7 +42,7 @@ proxies:
     tls: true
     udp: true
     flow: xtls-rprx-vision
-    servername: ://citygrainla.com
+    servername: portal.citygrainla.com
     reality-opts:
       public-key: BlSccfT5tvDIOS7v9VaPd0ulUNhUdvlMjGiNzDNDUHE
       short-id: 051f20c2344a2dfd
@@ -57,7 +57,7 @@ proxies:
     tls: true
     udp: true
     flow: xtls-rprx-vision
-    servername: ://citygrainla.com
+    servername: portal.citygrainla.com
     reality-opts:
       public-key: BlSccfT5tvDIOS7v9VaPd0ulUNhUdvlMjGiNzDNDUHE
       short-id: 051f20c2344a2dfd
@@ -72,7 +72,7 @@ proxies:
     tls: true
     udp: true
     flow: xtls-rprx-vision
-    servername: ://citygrainla.com
+    servername: portal.citygrainla.com
     reality-opts:
       public-key: BlSccfT5tvDIOS7v9VaPd0ulUNhUdvlMjGiNzDNDUHE
       short-id: 051f20c2344a2dfd
@@ -87,7 +87,7 @@ proxies:
     tls: true
     udp: true
     flow: xtls-rprx-vision
-    servername: ://citygrainla.com
+    servername: portal.citygrainla.com
     reality-opts:
       public-key: BlSccfT5tvDIOS7v9VaPd0ulUNhUdvlMjGiNzDNDUHE
       short-id: 051f20c2344a2dfd
@@ -117,7 +117,7 @@ proxy-groups:
 
   - name: "♻️ 自动选择"
     type: url-test
-    url: http://gstatic.com
+    url: http://www.gstatic.com/generate_204
     interval: 300
     tolerance: 50
     proxies:
