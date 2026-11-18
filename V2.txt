@@ -1,4 +1,3 @@
-yaml
 mixed-port: 7890
 allow-lan: true
 bind-address: '*'
@@ -106,6 +105,16 @@ proxy-groups:
       - "JMS-1501320@c87s801"
       - DIRECT
 
+  - name: "🎥 奈飞视频"
+    type: select
+    proxies:
+      - "🚀 节点选择"
+      - "JMS-1501320@c87s2"
+      - "JMS-1501320@c87s3"
+      - "JMS-1501320@c87s4"
+      - "JMS-1501320@c87s5"
+      - "JMS-1501320@c87s801"
+
   - name: "♻️ 自动选择"
     type: url-test
     url: http://gstatic.com
@@ -119,6 +128,11 @@ proxy-groups:
       - "JMS-1501320@c87s801"
 
 rules:
+  - DOMAIN-SUFFIX,netflix.com,🎥 奈飞视频
+  - DOMAIN-SUFFIX,netflix.net,🎥 奈飞视频
+  - DOMAIN-SUFFIX,nflximg.net,🎥 奈飞视频
+  - DOMAIN-SUFFIX,nflxvideo.net,🎥 奈飞视频
+  - DOMAIN-SUFFIX,nflxext.com,🎥 奈飞视频
   - GEOIP,LAN,DIRECT,no-resolve
   - GEOIP,CN,DIRECT
   - MATCH,🚀 节点选择
