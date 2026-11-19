@@ -1,26 +1,7 @@
-mixed-port: 7890
-allow-lan: true
-bind-address: '*'
-mode: rule
-log-level: info
-external-controller: '127.0.0.1:9090'
-
-dns:
-  enable: true
-  ipv6: false
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  nameserver:
-    - 223.5.5.5
-    - 119.29.29.29
-  fallback:
-    - https://1.1.1.1/dns-query
-    - https://8.8.8.8/dns-query
-
 proxies:
-  - name: "JMS-1501320@c87s2"
+  - name: "JMS-1501320@c87s2.portablesubmarines.com:443"
     type: vless
-    server: 107.182.190.195
+    server: 144.34.187.102
     port: 443
     uuid: d51910f3-26e3-4397-9913-5682fd353a66
     network: tcp
@@ -33,9 +14,9 @@ proxies:
       short-id: 051f20c2344a2dfd
     client-fingerprint: chrome
 
-  - name: "JMS-1501320@c87s3"
+  - name: "JMS-1501320@c87s3.portablesubmarines.com:443"
     type: vless
-    server: 104.243.17.81
+    server: 104.243.17.244
     port: 443
     uuid: d51910f3-26e3-4397-9913-5682fd353a66
     network: tcp
@@ -48,9 +29,9 @@ proxies:
       short-id: 051f20c2344a2dfd
     client-fingerprint: chrome
 
-  - name: "JMS-1501320@c87s4"
+  - name: "JMS-1501320@c87s4.portablesubmarines.com:443"
     type: vless
-    server: 206.190.237.254
+    server: 206.190.239.229
     port: 443
     uuid: d51910f3-26e3-4397-9913-5682fd353a66
     network: tcp
@@ -63,9 +44,9 @@ proxies:
       short-id: 051f20c2344a2dfd
     client-fingerprint: chrome
 
-  - name: "JMS-1501320@c87s5"
+  - name: "JMS-1501320@c87s5.portablesubmarines.com:443"
     type: vless
-    server: 104.245.99.84
+    server: 104.245.103.71
     port: 443
     uuid: d51910f3-26e3-4397-9913-5682fd353a66
     network: tcp
@@ -78,9 +59,9 @@ proxies:
       short-id: 051f20c2344a2dfd
     client-fingerprint: chrome
 
-  - name: "JMS-1501320@c87s801"
+  - name: "JMS-1501320@c87s801.portablesubmarines.com:443"
     type: vless
-    server: 23.83.227.39
+    server: 174.137.53.119
     port: 443
     uuid: d51910f3-26e3-4397-9913-5682fd353a66
     network: tcp
@@ -92,47 +73,3 @@ proxies:
       public-key: BlSccfT5tvDIOS7v9VaPd0ulUNhUdvlMjGiNzDNDUHE
       short-id: 051f20c2344a2dfd
     client-fingerprint: chrome
-
-proxy-groups:
-  - name: "🚀 节点选择"
-    type: select
-    proxies:
-      - "♻️ 自动选择"
-      - "JMS-1501320@c87s2"
-      - "JMS-1501320@c87s3"
-      - "JMS-1501320@c87s4"
-      - "JMS-1501320@c87s5"
-      - "JMS-1501320@c87s801"
-      - DIRECT
-
-  - name: "🎥 奈飞视频"
-    type: select
-    proxies:
-      - "🚀 节点选择"
-      - "JMS-1501320@c87s2"
-      - "JMS-1501320@c87s3"
-      - "JMS-1501320@c87s4"
-      - "JMS-1501320@c87s5"
-      - "JMS-1501320@c87s801"
-
-  - name: "♻️ 自动选择"
-    type: url-test
-    url: http://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
-    proxies:
-      - "JMS-1501320@c87s2"
-      - "JMS-1501320@c87s3"
-      - "JMS-1501320@c87s4"
-      - "JMS-1501320@c87s5"
-      - "JMS-1501320@c87s801"
-
-rules:
-  - DOMAIN-SUFFIX,netflix.com,🎥 奈飞视频
-  - DOMAIN-SUFFIX,netflix.net,🎥 奈飞视频
-  - DOMAIN-SUFFIX,nflximg.net,🎥 奈飞视频
-  - DOMAIN-SUFFIX,nflxvideo.net,🎥 奈飞视频
-  - DOMAIN-SUFFIX,nflxext.com,🎥 奈飞视频
-  - GEOIP,LAN,DIRECT,no-resolve
-  - GEOIP,CN,DIRECT
-  - MATCH,🚀 节点选择
